@@ -47,7 +47,8 @@ impl AckFrequencyState {
         config
             .max_ack_delay
             .unwrap_or(self.peer_max_ack_delay)
-            .clamp(min_ack_delay, rtt.max(MIN_AUTOMATIC_ACK_DELAY))
+            .min(rtt.max(MIN_AUTOMATIC_ACK_DELAY))
+            .max(min_ack_delay)
     }
 
     /// Returns the `max_ack_delay` for the purposes of calculating the PTO

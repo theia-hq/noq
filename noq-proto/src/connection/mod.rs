@@ -5186,22 +5186,9 @@ impl Connection {
                             self.open_nat_traversed_paths(now);
                         }
                         Ok(Some((retired, reset_token))) => {
-                            let pending_retired =
-                                &mut self.spaces[SpaceId::Data].pending.retire_cids;
-                            /// Ensure `pending_retired` cannot grow without bound. Limit is
-                            /// somewhat arbitrary but very permissive.
-                            const MAX_PENDING_RETIRED_CIDS: u64 = CidQueue::LEN as u64 * 10;
-                            // We don't bother counting in-flight frames because those are bounded
-                            // by congestion control.
-                            if (pending_retired.len() as u64)
-                                .saturating_add(retired.end.saturating_sub(retired.start))
-                                > MAX_PENDING_RETIRED_CIDS
-                            {
-                                return Err(TransportError::CONNECTION_ID_LIMIT_ERROR(
-                                    "queued too many retired CIDs",
-                                ));
-                            }
-                            pending_retired.extend(retired.map(|seq| (path_id, seq)));
+                            self.spaces[SpaceId::Data]
+                                .pending
+                                .retire_cids(path_id, retired)?;
                             self.set_reset_token(path_id, network_path.remote, reset_token);
                             self.open_nat_traversed_paths(now);
                         }
@@ -5215,8 +5202,7 @@ impl Connection {
                             // was retired all at once via retire_prior_to.
                             self.spaces[SpaceId::Data]
                                 .pending
-                                .retire_cids
-                                .push((path_id, frame.sequence));
+                                .retire_cids(path_id, frame.sequence..frame.sequence + 1)?;
                             continue;
                         }
                     };
@@ -7825,3 +7811,6 @@ mod tests {
         assert_eq!(t.max(), Some(PathId(3)));
     }
 }
+
+#[cfg(test)]
+mod security_tests;

@@ -2522,7 +2522,7 @@ fn datagram_batch_send_empty_is_ok() {
 #[test]
 fn datagram_recv_buffer_overflow() {
     let _guard = subscribe();
-    const WINDOW: usize = 100;
+    const WINDOW: usize = 1000;
     let server = ServerConfig {
         transport: Arc::new(TransportConfig {
             datagram_receive_buffer_size: Some(WINDOW),
@@ -4476,7 +4476,7 @@ fn oversized_datagrams_trigger_unblock() {
 
     assert_eq!(
         pair.client_datagrams(client_ch).send_buffer_space(),
-        send_buffer_size,
+        send_buffer_size - core::mem::size_of::<Datagram>(),
         "expected the send buffer to be empty after too large datagrams were dropped",
     );
     match pair.client_conn_mut(client_ch).poll() {
@@ -5134,4 +5134,21 @@ fn sent_packets_stats_snapshot_test() {
     let server_stats2 = pair.server_conn_mut(server_ch).stats();
     assert_eq!(client_stats2.sent_packets, 14);
     assert_eq!(server_stats2.sent_packets, 11);
+}
+
+// Connected fixture for connection-private frame and queue regressions.
+pub(crate) fn security_connection(config: TransportConfig) -> Connection {
+    let config = Arc::new(config);
+    let mut pair = Pair::new(
+        Default::default(),
+        ServerConfig {
+            transport: config.clone(),
+            ..server_config()
+        },
+    );
+    let (client, _) = pair.connect_with(ClientConfig {
+        transport: config,
+        ..client_config()
+    });
+    pair.client.connections.remove(&client).unwrap()
 }

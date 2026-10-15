@@ -2,7 +2,7 @@ use std::{
     cmp,
     collections::{BTreeMap, BTreeSet, VecDeque},
     mem,
-    ops::{Bound, Index, IndexMut},
+    ops::{Bound, Index, IndexMut, Range},
 };
 
 use rand::{CryptoRng, RngExt};
@@ -13,6 +13,7 @@ use tracing::trace;
 use super::{PathId, paths::PathResponses, paths::PathRetransmits};
 use crate::{
     Dir, Duration, FourTuple, Instant, StreamId, TransportError, TransportErrorCode, VarInt,
+    cid_queue::CidQueue,
     connection::StreamsState,
     frame::{self, AddAddress, RemoveAddress},
     packet::SpaceId,
@@ -603,6 +604,27 @@ pub struct Retransmits {
 }
 
 impl Retransmits {
+    /// Bound new peer-frame retirement work across all paths. In-flight retransmissions are
+    /// congestion-controlled and local CID rotation retains its existing admission policy.
+    pub(super) fn retire_cids(
+        &mut self,
+        path: PathId,
+        sequences: Range<u64>,
+    ) -> Result<(), TransportError> {
+        const MAX_PENDING_RETIRED_CIDS: usize = CidQueue::LEN * 10;
+        let available = MAX_PENDING_RETIRED_CIDS.checked_sub(self.retire_cids.len());
+        let count = sequences.end.checked_sub(sequences.start);
+        if !matches!((available, count), (Some(available), Some(count)) if u128::from(count) <= available as u128)
+        {
+            return Err(TransportError::CONNECTION_ID_LIMIT_ERROR(
+                "queued too many retired CIDs",
+            ));
+        }
+        self.retire_cids
+            .extend(sequences.map(|sequence| (path, sequence)));
+        Ok(())
+    }
+
     pub(super) fn is_empty(&self, streams: &StreamsState) -> bool {
         let Self {
             max_data,

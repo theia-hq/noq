@@ -300,23 +300,23 @@ impl TransportConfig {
         self
     }
 
-    /// Maximum number of incoming application datagram bytes to buffer, or None to disable
-    /// incoming datagrams
+    /// Buffer budget in bytes for incoming datagrams, or `None` to disable them
     ///
-    /// The peer is forbidden to send single datagrams larger than this size. If the aggregate size
-    /// of all datagrams that have been received from the peer but not consumed by the application
-    /// exceeds this value, old datagrams are dropped until it is no longer exceeded.
+    /// The budget includes payload bytes and fixed overhead for each queued datagram.
+    /// The peer is forbidden to send a datagram whose payload exceeds this value.
+    /// A datagram that cannot fit the budget on its own is silently dropped without
+    /// evicting buffered datagrams. Otherwise, older datagrams are dropped as needed
+    /// to make room for the new one.
     pub fn datagram_receive_buffer_size(&mut self, value: Option<usize>) -> &mut Self {
         self.datagram_receive_buffer_size = value;
         self
     }
 
-    /// Maximum number of outgoing application datagram bytes to buffer
+    /// Buffer budget in bytes for outgoing datagrams
     ///
-    /// While datagrams are sent ASAP, it is possible for an application to generate data faster
-    /// than the link, or even the underlying hardware, can transmit them. This limits the amount of
-    /// memory that may be consumed in that case. When the send buffer is full and a new datagram is
-    /// sent, older datagrams are dropped until sufficient space is available.
+    /// The budget includes payload bytes and fixed overhead for each queued datagram.
+    /// A datagram that cannot fit the budget on its own is rejected. When a send permits
+    /// dropping buffered datagrams, the oldest are dropped as needed to make room.
     pub fn datagram_send_buffer_size(&mut self, value: usize) -> &mut Self {
         self.datagram_send_buffer_size = value;
         self

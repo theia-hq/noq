@@ -34,7 +34,7 @@ impl Datagrams<'_> {
             .max_size()
             .ok_or(SendDatagramError::UnsupportedByPeer)?;
         let send_buffer_size = self.conn.config.datagram_send_buffer_size;
-        if data.len() > Ord::min(max, send_buffer_size) {
+        if data.len() > max || !DatagramQueue::item_fits(data.len(), send_buffer_size) {
             return Err(SendDatagramError::TooLarge);
         }
         if drop {
@@ -49,7 +49,6 @@ impl Datagrams<'_> {
             self.conn.datagrams.send_blocked = true;
             return Err(SendDatagramError::Blocked(data));
         }
-        self.conn.datagrams.outgoing_total += data.len();
         self.conn.datagrams.outgoing.push_back(Datagram { data });
         Ok(())
     }
@@ -86,7 +85,7 @@ impl Datagrams<'_> {
         let send_buffer_size = self.conn.config.datagram_send_buffer_size;
         if datagrams
             .iter()
-            .any(|data| data.len() > Ord::min(max, send_buffer_size))
+            .any(|data| data.len() > max || !DatagramQueue::item_fits(data.len(), send_buffer_size))
         {
             return Err(SendDatagramError::TooLarge);
         }
@@ -105,7 +104,6 @@ impl Datagrams<'_> {
                 self.conn.datagrams.send_blocked = true;
                 break;
             }
-            self.conn.datagrams.outgoing_total += data.len();
             self.conn
                 .datagrams
                 .outgoing
@@ -160,26 +158,30 @@ impl Datagrams<'_> {
         self.conn.datagrams.recv_many(out)
     }
 
-    /// Bytes available in the outgoing datagram buffer
+    /// Payload bytes available for one additional datagram, after reserving its queue record
     ///
-    /// When greater than zero, [`send`](Self::send)ing a datagram of at most this size is
-    /// guaranteed not to cause older datagrams to be dropped.
+    /// When greater than zero, [`send`](Self::send)ing a datagram of at most this size
+    /// does not require dropping older datagrams. A return value of zero does not
+    /// indicate whether an empty datagram fits.
     pub fn send_buffer_space(&self) -> usize {
         self.conn
             .config
             .datagram_send_buffer_size
-            .saturating_sub(self.conn.datagrams.outgoing_total)
+            .saturating_sub(
+                self.conn
+                    .datagrams
+                    .outgoing
+                    .memory_usage()
+                    .unwrap_or(usize::MAX),
+            )
+            .saturating_sub(DatagramQueue::OVERHEAD)
     }
 }
 
 #[derive(Default)]
 pub(super) struct DatagramState {
-    /// Number of bytes of datagrams that have been received by the local transport but not
-    /// delivered to the application
-    pub(super) recv_buffered: usize,
-    pub(super) incoming: VecDeque<Datagram>,
-    pub(super) outgoing: VecDeque<Datagram>,
-    pub(super) outgoing_total: usize,
+    pub(super) incoming: DatagramQueue,
+    pub(super) outgoing: DatagramQueue,
     pub(super) send_blocked: bool,
 }
 
@@ -202,13 +204,15 @@ impl DatagramState {
             return Err(TransportError::PROTOCOL_VIOLATION("oversized datagram"));
         }
 
-        let was_empty = self.recv_buffered == 0;
-        while datagram.data.len() + self.recv_buffered > window {
-            debug!("dropping stale datagram");
-            self.recv();
+        // A wire-valid payload may still exceed the local budget once its record is charged.
+        if !DatagramQueue::item_fits(datagram.data.len(), window) {
+            return Ok(false);
         }
-
-        self.recv_buffered += datagram.data.len();
+        let was_empty = self.incoming.is_empty();
+        while !self.incoming.has_space(datagram.data.len(), window) {
+            debug!("dropping stale datagram");
+            self.incoming.pop_front();
+        }
         self.incoming.push_back(datagram);
         Ok(was_empty)
     }
@@ -219,16 +223,11 @@ impl DatagramState {
                 break;
             };
             trace!(len = prev.data.len(), "dropping outgoing datagram");
-            self.outgoing_total -= prev.data.len();
         }
     }
 
     fn has_send_buffer_space(&self, datagram_len: usize, send_buffer_size: usize) -> bool {
-        let Some(total) = self.outgoing_total.checked_add(datagram_len) else {
-            return false;
-        };
-
-        total <= send_buffer_size
+        self.outgoing.has_space(datagram_len, send_buffer_size)
     }
 
     /// Discard outgoing datagrams with a payload larger than `max_payload` bytes
@@ -247,7 +246,6 @@ impl DatagramState {
                     datagram.data.len(),
                     max_payload
                 );
-                self.outgoing_total -= datagram.data.len();
                 dropped_any = true;
             }
             result
@@ -264,26 +262,24 @@ impl DatagramState {
         buf: &mut PacketBuilder<'a, 'b>,
         stat: &mut FrameStats,
     ) -> bool {
-        let Some(datagram) = self.outgoing.pop_front() else {
+        let Some(datagram) = self.outgoing.front() else {
             return false;
         };
 
         if buf.frame_space_remaining() < datagram.size(true) {
-            // Future work: we could be more clever about cramming small datagrams into
-            // mostly-full packets when a larger one is queued first
-            self.outgoing.push_front(datagram);
+            // Leave the head and its accounting untouched until a packet can accommodate it.
             return false;
         }
 
-        self.outgoing_total -= datagram.data.len();
+        let Some(datagram) = self.outgoing.pop_front() else {
+            return false;
+        };
         buf.write_frame(datagram, stat);
         true
     }
 
     pub(super) fn recv(&mut self) -> Option<Bytes> {
-        let x = self.incoming.pop_front()?.data;
-        self.recv_buffered -= x.len();
-        Some(x)
+        Some(self.incoming.pop_front()?.data)
     }
 
     /// Drain up to `out.len()` buffered datagrams into `out`, in arrival order.
@@ -291,53 +287,96 @@ impl DatagramState {
     /// Returns the number of datagrams written into `out` (which may be less than
     /// `out.len()` if fewer are buffered). Remaining datagrams stay queued.
     pub(super) fn recv_many(&mut self, out: &mut [Bytes]) -> usize {
-        let n = out.len().min(self.incoming.len());
-        let mut received_bytes = 0;
-        for (i, d) in self.incoming.drain(..n).enumerate() {
-            received_bytes += d.data.len();
-            out[i] = d.data;
+        let mut received = 0;
+        for slot in out {
+            let Some(datagram) = self.incoming.pop_front() else {
+                break;
+            };
+            *slot = datagram.data;
+            received += 1;
         }
-        self.recv_buffered -= received_bytes;
-        n
+        received
+    }
+}
+
+/// Owns payload accounting for every queue mutation. Each initialized record also consumes
+/// `size_of::<Datagram>()` bytes, including when its payload is empty.
+#[derive(Default)]
+pub(super) struct DatagramQueue {
+    queue: VecDeque<Datagram>,
+    payload_total: usize,
+}
+
+impl DatagramQueue {
+    const OVERHEAD: usize = {
+        let size = core::mem::size_of::<Datagram>();
+        assert!(size > 0);
+        size
+    };
+
+    fn item_fits(payload_len: usize, budget: usize) -> bool {
+        payload_len
+            .checked_add(Self::OVERHEAD)
+            .is_some_and(|charge| charge <= budget)
+    }
+
+    fn memory_usage(&self) -> Option<usize> {
+        self.queue
+            .len()
+            .checked_mul(Self::OVERHEAD)?
+            .checked_add(self.payload_total)
+    }
+
+    fn has_space(&self, payload_len: usize, budget: usize) -> bool {
+        let Some(remaining) = self
+            .memory_usage()
+            .and_then(|usage| budget.checked_sub(usage))
+        else {
+            return false;
+        };
+        Self::item_fits(payload_len, remaining)
+    }
+
+    pub(super) fn is_empty(&self) -> bool {
+        self.queue.is_empty()
+    }
+
+    pub(super) fn front(&self) -> Option<&Datagram> {
+        self.queue.front()
+    }
+
+    fn push_back(&mut self, datagram: Datagram) {
+        // Admission proved payload plus initialized records fits in a usize-sized budget.
+        self.payload_total += datagram.data.len();
+        self.queue.push_back(datagram);
+    }
+
+    fn pop_front(&mut self) -> Option<Datagram> {
+        let datagram = self.queue.pop_front()?;
+        self.payload_total -= datagram.data.len();
+        Some(datagram)
+    }
+
+    fn retain(&mut self, mut keep: impl FnMut(&Datagram) -> bool) {
+        self.queue.retain(|datagram| {
+            if keep(datagram) {
+                true
+            } else {
+                self.payload_total -= datagram.data.len();
+                false
+            }
+        });
+    }
+
+    #[cfg(test)]
+    pub(super) fn len(&self) -> usize {
+        self.queue.len()
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn make_space_for_accounts_for_new_datagram() {
-        let mut state = DatagramState::default();
-        state.outgoing.push_back(Datagram {
-            data: Bytes::from_static(&[0; 7]),
-        });
-        state.outgoing.push_back(Datagram {
-            data: Bytes::from_static(&[0; 2]),
-        });
-        state.outgoing_total = 9;
-
-        state.make_space_for(4, 10);
-
-        assert_eq!(state.outgoing.len(), 1);
-        assert_eq!(state.outgoing[0].data.len(), 2);
-        assert_eq!(state.outgoing_total, 2);
-    }
-
-    #[test]
-    fn make_space_for_handles_overflowing_capacity_check() {
-        let mut state = DatagramState::default();
-        state.outgoing.push_back(Datagram {
-            data: Bytes::from_static(&[0]),
-        });
-        state.outgoing_total = usize::MAX - 1;
-
-        state.make_space_for(2, usize::MAX);
-
-        assert!(state.outgoing.is_empty());
-        assert_eq!(state.outgoing_total, usize::MAX - 2);
-    }
-}
+#[path = "datagrams_tests.rs"]
+mod datagrams_tests;
 
 /// Errors that can arise when sending a datagram
 #[derive(Debug, Error, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
