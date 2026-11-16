@@ -1149,6 +1149,57 @@ impl proptest::arbitrary::Arbitrary for Ack {
 }
 
 impl Ack {
+    /// Retain the newest whole ranges that fit, without changing the receive history.
+    ///
+    /// The returned set is also the encoder's view for logging and sent-frame tracking.
+    pub(crate) fn bounded_ranges(
+        path_id: Option<PathId>,
+        delay: u64,
+        ranges: &ArrayRangeSet,
+        ecn: Option<&EcnCounts>,
+        budget: usize,
+    ) -> Option<ArrayRangeSet> {
+        let mut rest = ranges.iter().rev();
+        let first = rest.next()?;
+        let kind = match (path_id.is_some(), ecn.is_some()) {
+            (false, false) => FrameType::Ack,
+            (false, true) => FrameType::AckEcn,
+            (true, false) => FrameType::PathAck,
+            (true, true) => FrameType::PathAckEcn,
+        };
+        let mut size = VarInt(kind.to_u64()).size()
+            + path_id.map_or(0, |path| VarInt(path.0.into()).size())
+            + VarInt(first.end - 1).size()
+            + VarInt(delay).size()
+            + VarInt(0).size()
+            + VarInt(first.end - first.start - 1).size();
+        if let Some(ecn) = ecn {
+            size += VarInt(ecn.ect0).size() + VarInt(ecn.ect1).size() + VarInt(ecn.ce).size();
+        }
+        if size > budget {
+            return None;
+        }
+
+        let mut selected = ArrayRangeSet::default();
+        let mut prev = first.start;
+        selected.insert(first);
+        for block in rest {
+            let count = selected.range_count() as u64;
+            let next_size = size
+                + VarInt(prev - block.end - 1).size()
+                + VarInt(block.end - block.start - 1).size()
+                + VarInt(count).size()
+                - VarInt(count - 1).size();
+            if next_size > budget {
+                break;
+            }
+            size = next_size;
+            prev = block.start;
+            selected.insert(block);
+        }
+        Some(selected)
+    }
+
     pub(crate) fn encoder<'a>(
         delay: u64,
         ranges: &'a ArrayRangeSet,
@@ -2082,6 +2133,9 @@ pub(crate) struct AckFrequency {
 }
 
 impl AckFrequency {
+    // The type and all four fields are variable-width integers.
+    pub(crate) const SIZE_BOUND: usize = FrameType::AckFrequency.size() + 4 * 8;
+
     const fn get_type(&self) -> FrameType {
         FrameType::AckFrequency
     }
@@ -2645,6 +2699,35 @@ mod test {
         match &frames[0] {
             Frame::AckFrequency(decoded) => assert_eq!(decoded, &original),
             x => panic!("incorrect frame {x:?}"),
+        }
+    }
+
+    #[test]
+    fn ack_frequency_size_bound_covers_all_varint_widths() {
+        for value in [
+            VarInt(0),
+            VarInt(63),
+            VarInt(64),
+            VarInt(16383),
+            VarInt(16384),
+            VarInt(1 << 30),
+            VarInt::MAX,
+        ] {
+            let original = AckFrequency {
+                sequence: value,
+                ack_eliciting_threshold: value,
+                request_max_ack_delay: value,
+                reordering_threshold: value,
+            };
+            let mut buf = Vec::new();
+            original.encode(&mut buf);
+            assert!(buf.len() <= AckFrequency::SIZE_BOUND);
+            if value == VarInt::MAX {
+                assert_eq!(buf.len(), AckFrequency::SIZE_BOUND);
+            }
+            let frames = frames(buf);
+            assert_eq!(frames.len(), 1);
+            assert!(matches!(&frames[0], Frame::AckFrequency(decoded) if decoded == &original));
         }
     }
 

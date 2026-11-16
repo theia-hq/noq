@@ -688,6 +688,11 @@ impl StreamsState {
             ));
         }
 
+        if id.dir() == Dir::Bi {
+            // Validate before implicitly opening the peer's streams.
+            self.validate_receive_id(id)?;
+        }
+
         // Create state for this stream if the remote peer created it.
         self.ensure_remote(id);
 
@@ -982,6 +987,91 @@ mod tests {
             (1024 * 1024u32).into(),
             (1024 * 1024u32).into(),
         )
+    }
+
+    #[test]
+    fn max_stream_data_rejects_remote_limit_without_state_changes() {
+        for side in [Side::Client, Side::Server] {
+            for limit in [0, 1, 128] {
+                let mut streams = make(side);
+                streams.max_remote[Dir::Bi as usize] = limit;
+                if limit != 0 {
+                    streams
+                        .received_max_stream_data(StreamId::new(!side, Dir::Bi, 0), 1)
+                        .unwrap();
+                }
+                let send_len = streams.send.len();
+                let recv_len = streams.recv.len();
+                let next_remote = streams.next_remote;
+                let opened = streams.opened;
+                let event_count = streams.events.len();
+                let free_recv = streams.free_recv.len();
+                for index in [limit, limit + 1, 1 << 40] {
+                    let error = streams
+                        .received_max_stream_data(StreamId::new(!side, Dir::Bi, index), 2)
+                        .unwrap_err();
+                    assert_eq!(error.code, TransportErrorCode::STREAM_LIMIT_ERROR);
+                    assert_eq!(streams.send.len(), send_len);
+                    assert_eq!(streams.recv.len(), recv_len);
+                    assert_eq!(streams.next_remote, next_remote);
+                    assert_eq!(streams.opened, opened);
+                    assert_eq!(streams.events.len(), event_count);
+                    assert_eq!(streams.free_recv.len(), free_recv);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn max_stream_data_accepts_below_limit_and_ignores_closed_remote() {
+        let mut streams = make(Side::Server);
+        let id = StreamId::new(Side::Client, Dir::Bi, 127);
+        streams.received_max_stream_data(id, 1).unwrap();
+        assert_eq!(streams.next_remote[Dir::Bi as usize], 128);
+        assert_eq!(streams.send.len(), 128);
+        assert_eq!(streams.recv.len(), 128);
+        assert!(matches!(
+            streams.poll(),
+            Some(StreamEvent::Opened { dir: Dir::Bi })
+        ));
+        streams.send.remove(&id);
+        streams.recv.remove(&id);
+        streams.received_max_stream_data(id, 2).unwrap();
+        assert!(!streams.send.contains_key(&id));
+        assert!(!streams.recv.contains_key(&id));
+        assert!(!streams.opened[Dir::Bi as usize]);
+    }
+
+    #[test]
+    fn max_stream_data_preserves_local_and_unidirectional_rules() {
+        let mut streams = make(Side::Client);
+        for dir in Dir::iter() {
+            let local = StreamId::new(Side::Client, dir, 0);
+            assert_eq!(
+                streams.received_max_stream_data(local, 1).unwrap_err().code,
+                TransportErrorCode::STREAM_STATE_ERROR,
+            );
+            streams.next[dir as usize] = 1;
+            streams.send.insert(local, None);
+            streams.received_max_stream_data(local, 1).unwrap();
+            assert_eq!(streams.send[&local].as_ref().unwrap().max_data, 1);
+            streams.send.remove(&local);
+            streams.received_max_stream_data(local, 2).unwrap();
+            assert!(!streams.send.contains_key(&local));
+        }
+        for index in [0, 128, 1 << 40] {
+            let remote = StreamId::new(Side::Server, Dir::Uni, index);
+            assert_eq!(
+                streams
+                    .received_max_stream_data(remote, 1)
+                    .unwrap_err()
+                    .code,
+                TransportErrorCode::STREAM_STATE_ERROR,
+            );
+        }
+        assert_eq!(streams.next_remote, [0, 0]);
+        assert!(streams.recv.is_empty());
+        assert_eq!(streams.opened, [false, false]);
     }
 
     #[test]

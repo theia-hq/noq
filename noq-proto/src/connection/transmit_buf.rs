@@ -209,6 +209,13 @@ impl<'a> TransmitBuf<'a> {
         self.buf.len()
     }
 
+    /// Discards an unfinished packet without changing datagram boundaries or earlier bytes.
+    pub(super) fn rollback_packet(&mut self, packet_start: usize) {
+        debug_assert!(packet_start >= self.datagram_start);
+        debug_assert!(packet_start <= self.buf.len());
+        self.buf.truncate(packet_start);
+    }
+
     /// Returns the already written bytes in the buffer
     pub(super) fn as_mut_slice(&mut self) -> &mut [u8] {
         self.buf.as_mut_slice()

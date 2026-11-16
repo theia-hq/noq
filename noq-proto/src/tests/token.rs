@@ -1,21 +1,199 @@
 //! Tests specifically for tokens
 
-use std::sync::{Arc, Mutex};
+use std::{
+    io::Cursor,
+    num::NonZeroUsize,
+    sync::{Arc, Mutex},
+};
 
 use assert_matches::assert_matches;
 
 use crate::{
-    ConnectionError, Duration, Event, SystemTime, TimeSource, TokenStore, TransportErrorCode,
-    VarInt,
+    ConnectionError, ConnectionId, DatagramEvent, Duration, Endpoint, EndpointConfig, Event,
+    FourTuple, Instant, SystemTime, TimeSource, TokenStore, TransportErrorCode, VarInt,
+    DEFAULT_SUPPORTED_VERSIONS,
+    frame::{ConnectionClose, Crypto, FrameStruct},
+    packet::{FixedLengthConnectionIdParser, Header, InitialHeader, PacketNumber, ProtectedHeader},
 };
 
 use super::util::{
     IncomingConnectionBehavior, Pair, client_config, server_config, subscribe, validate_incoming,
 };
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
 use wasm_bindgen_test::wasm_bindgen_test as test;
+
+#[test]
+fn oversized_cached_initial_token() {
+    let _guard = subscribe();
+    for mtu in [1200, 1500] {
+        let limit = initial_token_limit(mtu, None);
+        for token_len in [0, 64, limit - 1, limit, limit + 1, mtu as usize] {
+            let mut config = client_config();
+            Arc::get_mut(&mut config.transport)
+                .unwrap()
+                .initial_mtu(mtu);
+            config
+                .token_store
+                .insert("localhost", vec![0; token_len].into());
+            let mut endpoint = Endpoint::new(Arc::new(EndpointConfig::default()), None, true);
+            let now = Instant::now();
+            let (_, mut conn) = endpoint
+                .connect(now, config, "[::1]:4433".parse().unwrap(), "localhost")
+                .unwrap();
+            let mut buf = Vec::new();
+            let fits = token_len <= limit;
+            assert_eq!(
+                conn.poll_transmit(now, NonZeroUsize::MIN, &mut buf)
+                    .is_some(),
+                fits,
+                "token {token_len}, MTU {mtu}",
+            );
+            if fits {
+                assert!(buf.len() <= mtu as usize);
+                assert!(conn.stats().frame_tx.crypto > 0);
+            } else {
+                assert!(buf.is_empty());
+                assert_matches!(
+                    conn.poll(),
+                    Some(Event::ConnectionLost { reason: ConnectionError::TransportError(err) })
+                    if err.code == TransportErrorCode::PROTOCOL_VIOLATION
+                        && err.reason == "Initial token leaves insufficient packet space"
+                );
+                assert!(conn.is_drained());
+                assert!(
+                    conn.poll_transmit(now, NonZeroUsize::MIN, &mut buf)
+                        .is_none()
+                );
+                assert!(buf.is_empty());
+            }
+        }
+    }
+}
+
+#[test]
+fn oversized_retry_token() {
+    let _guard = subscribe();
+    let retry_cid = ConnectionId::new(&[1; 20]);
+    let limit = initial_token_limit(1200, Some(retry_cid));
+    for token_len in [64, limit - 1, limit, limit + 1, 1200] {
+        let address = "[::1]:4433".parse().unwrap();
+        let mut endpoint = Endpoint::new(Arc::new(EndpointConfig::default()), None, true);
+        let now = Instant::now();
+        let (_, mut conn) = endpoint
+            .connect(now, client_config(), address, "localhost")
+            .unwrap();
+        let mut buf = Vec::new();
+        assert!(
+            conn.poll_transmit(now, NonZeroUsize::MIN, &mut buf)
+                .is_some()
+        );
+        let ProtectedHeader::Initial(initial) = ProtectedHeader::decode(
+            &mut Cursor::new(&buf[..]),
+            &FixedLengthConnectionIdParser::new(0),
+            DEFAULT_SUPPORTED_VERSIONS,
+            false,
+        )
+        .unwrap() else {
+            panic!("expected an Initial packet");
+        };
+        let mut retry = Vec::new();
+        Header::Retry {
+            src_cid: retry_cid,
+            dst_cid: initial.src_cid,
+            version: initial.version,
+        }
+        .encode(&mut retry);
+        retry.resize(retry.len() + token_len, 0);
+        let tag = server_config()
+            .crypto
+            .retry_tag(initial.version, initial.dst_cid, &retry);
+        retry.extend_from_slice(&tag);
+        let Some(DatagramEvent::ConnectionEvent(_, event)) = endpoint.handle(
+            now,
+            FourTuple::new(address, None),
+            None,
+            BytesMut::from(&retry[..]),
+            &mut buf,
+        ) else {
+            panic!("Retry must be routed to the client connection");
+        };
+        conn.handle_event(event);
+        let now = now + Duration::from_secs(1);
+        let crypto_before = conn.stats().frame_tx.crypto;
+        buf.clear();
+        assert_eq!(
+            conn.poll_transmit(now, NonZeroUsize::MIN, &mut buf)
+                .is_some(),
+            token_len <= limit,
+            "Retry token {token_len}",
+        );
+        if token_len <= limit {
+            assert!(conn.stats().frame_tx.crypto > crypto_before);
+            assert!(buf.len() <= 1200);
+        } else {
+            assert!(buf.is_empty());
+            assert_matches!(
+                conn.poll(),
+                Some(Event::ConnectionLost { reason: ConnectionError::TransportError(err) })
+                if err.code == TransportErrorCode::PROTOCOL_VIOLATION
+            );
+            assert!(conn.is_drained());
+            assert!(
+                conn.poll_transmit(now, NonZeroUsize::MIN, &mut buf)
+                    .is_none()
+            );
+            assert!(buf.is_empty());
+        }
+    }
+}
+
+fn initial_token_limit(mtu: u16, retry_cid: Option<ConnectionId>) -> usize {
+    let mut endpoint = Endpoint::new(Arc::new(EndpointConfig::default()), None, true);
+    let now = Instant::now();
+    let (_, mut conn) = endpoint
+        .connect(
+            now,
+            client_config(),
+            "[::1]:4433".parse().unwrap(),
+            "localhost",
+        )
+        .unwrap();
+    let mut buf = Vec::new();
+    assert!(
+        conn.poll_transmit(now, NonZeroUsize::MIN, &mut buf)
+            .is_some()
+    );
+    let ProtectedHeader::Initial(initial) = ProtectedHeader::decode(
+        &mut Cursor::new(&buf[..]),
+        &FixedLengthConnectionIdParser::new(0),
+        DEFAULT_SUPPORTED_VERSIONS,
+        false,
+    )
+    .unwrap() else {
+        panic!("expected an Initial packet");
+    };
+    let dst_cid = retry_cid.unwrap_or(initial.dst_cid);
+    let keys = server_config()
+        .crypto
+        .initial_keys(initial.version, dst_cid)
+        .unwrap();
+    // Encode with a two-byte token length, as used by every boundary case below.
+    let mut header = Vec::new();
+    Header::Initial(InitialHeader {
+        src_cid: initial.src_cid,
+        dst_cid,
+        token: vec![0; 64].into(),
+        number: PacketNumber::new(0, 0),
+        version: initial.version,
+    })
+    .encode(&mut header);
+    let required = (Crypto::SIZE_BOUND + 1).max(ConnectionClose::SIZE_BOUND);
+    let limit = mtu as usize - (header.len() - 64) - keys.packet.local.tag_len() - required;
+    assert!((64..16384).contains(&limit));
+    limit
+}
 
 #[test]
 fn stateless_retry() {

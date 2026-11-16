@@ -537,6 +537,7 @@ fn recv_via_recvmmsg(
 }
 
 #[cfg(any(
+    test,
     target_os = "openbsd",
     target_os = "netbsd",
     target_os = "dragonfly",
@@ -553,23 +554,14 @@ pub(crate) fn recv_single(
     let mut name = MaybeUninit::<libc::sockaddr_storage>::uninit();
     let mut ctrl = cmsg::Aligned(MaybeUninit::<[u8; cmsg::LEN]>::uninit());
     let mut hdr = unsafe { mem::zeroed::<libc::msghdr>() };
-    prepare_recv(&mut bufs[0], &mut name, &mut ctrl, &mut hdr);
     let n = loop {
-        let n = unsafe { libc::recvmsg(io.as_raw_fd(), &mut hdr, 0) };
-
-        if hdr.msg_flags & libc::MSG_TRUNC != 0 {
-            continue;
-        }
-
-        if n >= 0 {
+        let n = retry_if_interrupted(|| {
+            // recvmsg mutates lengths and flags, even when another attempt is needed.
+            prepare_recv(&mut bufs[0], &mut name, &mut ctrl, &mut hdr);
+            unsafe { libc::recvmsg(io.as_raw_fd(), &mut hdr, 0) }
+        })?;
+        if hdr.msg_flags & libc::MSG_TRUNC == 0 {
             break n;
-        }
-
-        let e = io::Error::last_os_error();
-        match e.kind() {
-            // Retry receiving
-            io::ErrorKind::Interrupted => continue,
-            _ => return Err(e),
         }
     };
     meta[0] = decode_recv(&name, &hdr, n as usize)?;
@@ -911,6 +903,84 @@ pub(crate) fn retry_if_interrupted(mut f: impl FnMut() -> isize) -> io::Result<i
         let e = io::Error::last_os_error();
         if e.kind() != io::ErrorKind::Interrupted {
             return Err(e);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{net::UdpSocket, sync::mpsc, thread, time::Duration};
+
+    use super::*;
+
+    #[test]
+    fn recv_single_after_truncation_returns_would_block() {
+        let (result, _, _) = receive_tiny_datagrams(&[&[0; 16]]);
+        assert!(matches!(result, Err(error) if error.kind() == io::ErrorKind::WouldBlock));
+    }
+
+    #[test]
+    fn recv_single_skips_truncation_and_preserves_fitting_metadata() {
+        let (result, buffer, meta) = receive_tiny_datagrams(&[&[0; 16], b"ok"]);
+        assert_eq!(result.unwrap(), 1);
+        assert_eq!(meta.len, 2);
+        assert_eq!(meta.stride, 2);
+        assert_eq!(&buffer[..meta.len], b"ok");
+    }
+
+    fn receive_tiny_datagrams(datagrams: &[&[u8]]) -> (io::Result<usize>, [u8; 8], RecvMeta) {
+        let receiver = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        // A blocking socket with a receive timeout reports `WouldBlock` once the queue stays
+        // empty, without racing loopback delivery the way a nonblocking read can.
+        receiver
+            .set_read_timeout(Some(Duration::from_millis(250)))
+            .unwrap();
+        let address = receiver.local_addr().unwrap();
+        let sender = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let sender_address = sender.local_addr().unwrap();
+        for datagram in datagrams {
+            sender.send_to(datagram, address).unwrap();
+        }
+        // A channel bounds the wait; a fitting recovery datagram releases the stale-flag loop.
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let mut buffer = [0; 8];
+            let mut meta = [RecvMeta::default()];
+            let result = recv_single(
+                SockRef::from(&receiver),
+                &mut [IoSliceMut::new(&mut buffer)],
+                &mut meta,
+            );
+            let _ = done_tx.send((result, buffer, meta[0]));
+        });
+        match done_rx.recv_timeout(Duration::from_secs(1)) {
+            Ok(result) => {
+                worker.join().unwrap();
+                if result.0.is_ok() {
+                    assert_eq!(result.2.addr, sender_address);
+                }
+                result
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                worker.join().unwrap();
+                panic!("receive worker disconnected without a result");
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                for _ in 0..4 {
+                    let _ = sender.send_to(b"ok", address);
+                    match done_rx.recv_timeout(Duration::from_millis(250)) {
+                        Ok(_) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                            worker.join().unwrap();
+                            panic!("receive timed out; recovery settled the worker");
+                        }
+                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    }
+                }
+                // Never detach a spinning worker or block forever in join. If owned recovery
+                // fails, terminate this test process rather than leave a live receive loop.
+                eprintln!("receive recovery failed to settle its worker");
+                std::process::abort();
+            }
         }
     }
 }

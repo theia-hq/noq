@@ -1451,6 +1451,20 @@ impl Connection {
         }
     }
 
+    // Key transitions belong to packets that will actually be finished, not headers
+    // that may be rolled back when no pending frame fits.
+    fn commit_packet_space(&mut self, now: Instant, space_id: SpaceId) {
+        if self.crypto_state.has_keys(EncryptionLevel::Initial)
+            && space_id == SpaceId::Handshake
+            && self.side.is_client()
+        {
+            self.discard_space(now, SpaceKind::Initial);
+        }
+        if let Some(ref mut prev) = self.crypto_state.prev_crypto {
+            prev.update_unacked = false;
+        }
+    }
+
     /// poll_transmit logic for a QUIC-MULTIPATH packet number space (PathID + SpaceId).
     #[must_use]
     fn poll_transmit_path_space(
@@ -1614,18 +1628,6 @@ impl Connection {
             // From here on, we've determined that a packet will definitely be sent.
             //
 
-            if self.crypto_state.has_keys(EncryptionLevel::Initial)
-                && space_id == SpaceId::Handshake
-                && self.side.is_client()
-            {
-                // A client stops both sending and processing Initial packets when it
-                // sends its first Handshake packet.
-                self.discard_space(now, SpaceKind::Initial);
-            }
-            if let Some(ref mut prev) = self.crypto_state.prev_crypto {
-                prev.update_unacked = false;
-            }
-
             let Some(mut builder) =
                 PacketBuilder::new(now, space_id, path_id, remote_cid, transmit, self)
             else {
@@ -1639,8 +1641,6 @@ impl Connection {
                     path_blocked: PathBlocked::No,
                 };
             };
-            last_packet_number = Some(builder.packet_number);
-
             if space_id == SpaceId::Initial
                 && (self.side.is_client() || can_send.is_ack_eliciting() || needs_loss_probe)
             {
@@ -1675,22 +1675,13 @@ impl Connection {
                         &mut builder,
                         &mut self.path_stats.get_mut(path_id).frame_tx,
                         self.crypto_state.has_keys(space_id.encryption_level()),
+                        frame::ConnectionClose::SIZE_BOUND,
                     );
                 }
 
-                // Since there only 64 ACK frames there will always be enough space
-                // to encode the ConnectionClose frame too. However we still have the
-                // check here to prevent crashes if something changes.
-
-                // TODO(flub): This needs fixing for multipath, to ensure we can always
-                //    write the CONNECTION_CLOSE even if we have many PATH_ACKs to send:
-                //    https://github.com/n0-computer/noq/issues/367.
-                debug_assert!(
-                    builder.frame_space_remaining() > frame::ConnectionClose::SIZE_BOUND,
-                    "ACKs should leave space for ConnectionClose"
-                );
+                // Every ACK, including later PathACKs, must leave the close reservation intact.
                 let stats = &mut self.path_stats.get_mut(path_id).frame_tx;
-                if frame::ConnectionClose::SIZE_BOUND < builder.frame_space_remaining() {
+                if frame::ConnectionClose::SIZE_BOUND <= builder.frame_space_remaining() {
                     let max_frame_size = builder.frame_space_remaining();
                     let close: Close = match self.state.as_type() {
                         StateType::Closed => {
@@ -1710,6 +1701,7 @@ impl Connection {
                     builder.write_frame(close.encoder(max_frame_size), stats);
                 }
                 let last_pn = builder.packet_number;
+                self.commit_packet_space(now, space_id);
                 builder.finish_and_track(now, self, path_id, pad_datagram);
                 if space_id.kind() == self.highest_space {
                     // Don't send another close packet. Even with multipath we only send
@@ -1735,6 +1727,45 @@ impl Connection {
             }
 
             self.populate_packet(now, space_id, path_id, scheduling_info, &mut builder);
+
+            if builder.buf.len() == builder.partial_encode.start + builder.partial_encode.header_len
+            {
+                // A previous encrypted packet may have deferred its datagram padding to
+                // this tail. Complete it with authenticated padding, never trailing zeros
+                // outside a packet. This exception needs an earlier packet, so an ACK that
+                // cannot fit cannot generate standalone padding-only traffic forever.
+                let required_size = match pad_datagram {
+                    PadDatagram::No => 0,
+                    PadDatagram::ToSize(size) => usize::from(size),
+                    PadDatagram::ToSegmentSize => builder.buf.segment_size(),
+                    PadDatagram::ToMinMtu => usize::from(MIN_INITIAL_SIZE),
+                };
+                if builder.partial_encode.start > builder.buf.datagram_start_offset()
+                    && builder.partial_encode.start
+                        < builder.buf.datagram_start_offset() + required_size
+                {
+                    let pn = builder.packet_number;
+                    self.commit_packet_space(now, space_id);
+                    builder.finish_and_track(now, self, path_id, pad_datagram);
+                    return PollPathSpaceStatus::Send {
+                        last_packet_number: pn,
+                    };
+                }
+                // No prior padding obligation remains. Preserve the unsendable ACK and
+                // leave key-discard bookkeeping untouched for this abandoned packet.
+                builder.buf.rollback_packet(builder.partial_encode.start);
+                return match last_packet_number {
+                    Some(pn) => PollPathSpaceStatus::WrotePacket {
+                        last_packet_number: pn,
+                        pad_datagram,
+                    },
+                    None => PollPathSpaceStatus::NothingToSend {
+                        path_blocked: PathBlocked::No,
+                    },
+                };
+            }
+            self.commit_packet_space(now, space_id);
+            last_packet_number = Some(builder.packet_number);
 
             // ACK-only packets should only be sent when explicitly allowed. If we write them due to
             // any other reason, there is a bug which leads to one component announcing write
@@ -6126,6 +6157,16 @@ impl Connection {
             builder.write_frame(frame::ImmediateAck, stats);
         }
 
+        // Reserve before competing ACKs so a pending update cannot starve behind them.
+        // A smaller packet can still carry useful ACKs without consuming the update.
+        let ack_frequency_reservation = if space.pending.ack_frequency
+            && builder.frame_space_remaining() >= frame::AckFrequency::SIZE_BOUND
+        {
+            frame::AckFrequency::SIZE_BOUND
+        } else {
+            0
+        };
+
         // ACK
         if !scheduling_info.is_abandoned && scheduling_info.may_send_data {
             for path_id in space
@@ -6145,6 +6186,7 @@ impl Connection {
                     builder,
                     stats,
                     space_has_keys,
+                    ack_frequency_reservation,
                 );
             }
         }
@@ -6152,8 +6194,10 @@ impl Connection {
         // ACK_FREQUENCY
         if !scheduling_info.is_abandoned
             && scheduling_info.may_send_data
-            && mem::replace(&mut space.pending.ack_frequency, false)
+            && space.pending.ack_frequency
+            && builder.frame_space_remaining() >= frame::AckFrequency::SIZE_BOUND
         {
+            space.pending.ack_frequency = false;
             let sequence_number = self.ack_frequency.next_sequence_number();
 
             // Safe to unwrap because this is always provided when ACK frequency is enabled
@@ -6582,6 +6626,7 @@ impl Connection {
         builder: &mut PacketBuilder<'a, 'b>,
         stats: &mut FrameStats,
         space_has_keys: bool,
+        reserved_frame_space: usize,
     ) {
         // 0-RTT packets must never carry acks (which would have to be of handshake packets)
         debug_assert!(space_has_keys, "tried to send ACK in 0-RTT");
@@ -6611,14 +6656,24 @@ impl Connection {
         let ack_delay_exp = TransportParameters::default().ack_delay_exponent;
         let delay = delay_micros >> ack_delay_exp.into_inner();
 
-        if is_multipath_negotiated && space_id == SpaceId::Data {
-            if !ranges.is_empty() {
-                let frame = frame::PathAck::encoder(path_id, delay, ranges, ecn);
-                builder.write_frame(frame, stats);
-            }
+        let multipath_ack = is_multipath_negotiated && space_id == SpaceId::Data;
+        let Some(ranges) = frame::Ack::bounded_ranges(
+            multipath_ack.then_some(path_id),
+            delay,
+            ranges,
+            ecn,
+            builder
+                .frame_space_remaining()
+                .saturating_sub(reserved_frame_space),
+        ) else {
+            return;
+        };
+        let ack: frame::EncodableFrame<'_> = if multipath_ack {
+            frame::PathAck::encoder(path_id, delay, &ranges, ecn).into()
         } else {
-            builder.write_frame(frame::Ack::encoder(delay, ranges, ecn), stats);
-        }
+            frame::Ack::encoder(delay, &ranges, ecn).into()
+        };
+        builder.write_frame(ack, stats);
     }
 
     fn close_common(&mut self) {
@@ -7752,6 +7807,942 @@ fn negotiate_max_idle_timeout(x: Option<VarInt>, y: Option<VarInt>) -> Option<Du
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::coding::Encodable;
+
+    #[cfg(all(feature = "rustls", any(feature = "ring", feature = "aws-lc-rs")))]
+    mod initial_capacity {
+        use std::num::NonZeroUsize;
+
+        use bytes::BufMut;
+
+        use super::*;
+        use crate::{ClientConfig, Endpoint, EndpointConfig, TransportErrorCode};
+        use crate::packet::{FixedLengthConnectionIdParser, InitialHeader, PacketNumber, PartialDecode};
+
+        fn initial_connection(now: Instant, mtu: u16) -> Connection {
+            let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+            let mut roots = rustls::RootCertStore::empty();
+            roots.add(cert.cert.der().clone()).unwrap();
+            let mut config = ClientConfig::with_root_certificates(Arc::new(roots)).unwrap();
+            Arc::make_mut(&mut config.transport).initial_mtu(mtu);
+            Endpoint::new(Arc::new(EndpointConfig::default()), None, true)
+                .connect(now, config, "[::1]:4433".parse().unwrap(), "localhost")
+                .unwrap()
+                .1
+        }
+
+        #[test]
+        fn rejected_initial_rolls_back_only_current_header() {
+            for mtu in [8, 48, 64] {
+                for earlier_datagrams in [0, 1] {
+                    let now = Instant::now();
+                    let mut conn = initial_connection(now, 1200);
+                    let ConnectionSide::Client { token, .. } = &mut conn.side else {
+                        unreachable!();
+                    };
+                    *token = vec![0; 64].into();
+                    let mut bytes = Vec::new();
+                    let mut buf = TransmitBuf::new(&mut bytes, NonZeroUsize::new(2).unwrap(), mtu);
+                    if earlier_datagrams != 0 {
+                        buf.start_new_datagram();
+                        buf.put_bytes(7, mtu);
+                    }
+                    buf.start_new_datagram();
+                    buf.put_slice(b"prev");
+                    let prefix = buf.as_mut_slice().to_vec();
+                    let start = buf.datagram_start_offset();
+                    let max = buf.datagram_max_offset();
+                    let segment = buf.segment_size();
+                    let cid = conn.initial_dst_cid;
+                    assert!(
+                        PacketBuilder::new(
+                            Instant::now(),
+                            SpaceId::Initial,
+                            PathId::ZERO,
+                            cid,
+                            &mut buf,
+                            &mut conn,
+                        )
+                        .is_none()
+                    );
+                    assert_eq!(buf.as_mut_slice(), prefix);
+                    assert_eq!(buf.datagram_start_offset(), start);
+                    assert_eq!(buf.datagram_max_offset(), max);
+                    assert_eq!(buf.segment_size(), segment);
+                    assert_eq!(buf.num_datagrams(), earlier_datagrams + 1);
+                    assert!(conn.is_drained());
+                    assert!(matches!(
+                        conn.poll(),
+                        Some(Event::ConnectionLost { reason: ConnectionError::TransportError(error) })
+                        if error.code == TransportErrorCode::PROTOCOL_VIOLATION
+                    ));
+                }
+            }
+        }
+
+        #[test]
+        fn near_limit_initial_ack_makes_progress_without_closing() {
+            for mtu in [1200, 1500] {
+                for no_minimum_fit in [false, true] {
+                    let now = Instant::now();
+                    let mut conn = initial_connection(now, mtu as u16);
+                    let keys = conn
+                        .crypto_state
+                        .session
+                        .initial_keys(conn.initial_dst_cid, Side::Server);
+                    conn.receiving_ecn = no_minimum_fit;
+                    let space = &mut conn.spaces[SpaceId::Initial];
+                    // Isolate ACK readiness from the client's queued handshake flight.
+                    space.pending.crypto.clear();
+                    let pns = space.for_path(PathId::ZERO);
+                    for pn in (0..128).step_by(2) {
+                        pns.pending_acks.insert_one((1 << 30) + pn, now);
+                    }
+                    pns.ecn_counters = frame::EcnCounts {
+                        ect0: 1 << 30,
+                        ect1: 1 << 30,
+                        ce: 1 << 30,
+                    };
+                    pns.pending_acks.set_immediate_ack_required();
+                    let history: Vec<_> = pns.pending_acks.ranges().iter().collect();
+                    let frame_space =
+                        frame::ConnectionClose::SIZE_BOUND.max(frame::Crypto::SIZE_BOUND + 1);
+                    let mut header = Vec::new();
+                    Header::Initial(InitialHeader {
+                        src_cid: conn.handshake_cid,
+                        dst_cid: conn.initial_dst_cid,
+                        token: vec![0; 64].into(),
+                        number: PacketNumber::new(0, 0),
+                        version: conn.version,
+                    })
+                    .encode(&mut header);
+                    let token_len =
+                        mtu - (header.len() - 64) - keys.packet.remote.tag_len() - frame_space;
+                    assert!((64..16384).contains(&token_len));
+                    let ConnectionSide::Client { token, .. } = &mut conn.side else {
+                        unreachable!();
+                    };
+                    *token = vec![0; token_len].into();
+                    let mut bytes = Vec::new();
+                    let transmit = conn.poll_transmit(now, NonZeroUsize::MIN, &mut bytes);
+                    assert!(!conn.is_closed());
+                    if no_minimum_fit {
+                        assert!(transmit.is_none());
+                        assert!(bytes.is_empty());
+                        assert_eq!(conn.stats().frame_tx.acks, 0);
+                    } else {
+                        assert!(transmit.is_some());
+                        assert!(bytes.len() <= mtu);
+                        let (packet, rest) = PartialDecode::new(
+                            bytes.as_slice().into(),
+                            &FixedLengthConnectionIdParser::new(0),
+                            crate::DEFAULT_SUPPORTED_VERSIONS,
+                            false,
+                        )
+                        .unwrap();
+                        assert!(rest.is_none());
+                        let mut packet = packet.finish(Some(&*keys.header.remote)).unwrap();
+                        let pn = packet.header.number().unwrap().expand(0);
+                        keys.packet
+                            .remote
+                            .decrypt(PathId::ZERO, pn, &packet.header_data, &mut packet.payload)
+                            .unwrap();
+                        let mut frames = frame::Iter::new(packet.payload.freeze())
+                            .unwrap()
+                            .map(Result::unwrap)
+                            .filter(|frame| !matches!(frame, Frame::Padding));
+                        let Some(Frame::Ack(ack)) = frames.next() else {
+                            panic!("expected a useful ACK");
+                        };
+                        assert_eq!(ack.largest, history.last().unwrap().end - 1);
+                        assert!(ack.ranges.range_count() < history.len());
+                        assert!(ack.ranges.iter().all(|range| history.contains(&range)));
+                        let mut encoded = Vec::new();
+                        frame::Ack::encoder(ack.delay, &ack.ranges, ack.ecn.as_ref())
+                            .encode(&mut encoded);
+                        assert!(encoded.len() <= frame_space);
+                        assert!(frames.next().is_none());
+                        assert_eq!(conn.stats().frame_tx.acks, 1);
+                    }
+                    let pns = conn.spaces[SpaceId::Initial].for_path(PathId::ZERO);
+                    assert_eq!(
+                        pns.pending_acks.ranges().iter().collect::<Vec<_>>(),
+                        history
+                    );
+                    assert_eq!(pns.pending_acks.can_send(), no_minimum_fit);
+                    // An unsendable ACK stays pending without producing padding-only packets.
+                    // A sent subset suppresses ACK readiness until more packets arrive.
+                    for _ in 0..2 {
+                        bytes.clear();
+                        assert!(
+                            conn.poll_transmit(now, NonZeroUsize::MIN, &mut bytes)
+                                .is_none()
+                        );
+                        assert!(bytes.is_empty());
+                    }
+                    assert!(!conn.is_drained());
+                }
+            }
+        }
+
+        #[test]
+        fn unsendable_handshake_ack_preserves_deferred_padding_and_keys() {
+            for coalesced in [false, true] {
+                let now = Instant::now();
+                let mut conn = initial_connection(now, 1200);
+                let cid = ConnectionId::new(&[7; 20]);
+                conn.handshake_cid = ConnectionId::new(&[8; 20]);
+                conn.receiving_ecn = true;
+                conn.spaces[SpaceId::Initial].pending.crypto.clear();
+                // Reuse deterministic Initial-derived key material at the Handshake level
+                // to isolate packet construction from the TLS handshake state machine.
+                conn.crypto_state.spaces[SpaceKind::Handshake].keys = Some(
+                    conn.crypto_state
+                        .session
+                        .initial_keys(conn.initial_dst_cid, Side::Client),
+                );
+                let keys = conn
+                    .crypto_state
+                    .session
+                    .initial_keys(conn.initial_dst_cid, Side::Server);
+                let pns = conn.spaces[SpaceId::Handshake].for_path(PathId::ZERO);
+                pns.pending_acks.insert_one(1 << 30, now);
+                pns.pending_acks.set_immediate_ack_required();
+                pns.ecn_counters = frame::EcnCounts {
+                    ect0: 1 << 30,
+                    ect1: 1 << 30,
+                    ce: 1 << 30,
+                };
+                let history: Vec<_> = pns.pending_acks.ranges().iter().collect();
+                let scheduling = PathSchedulingInfo {
+                    is_abandoned: false,
+                    may_send_data: true,
+                    may_send_close: false,
+                    may_self_abandon: false,
+                };
+                let tail_capacity = MIN_PACKET_SPACE + 1;
+                let mut bytes = Vec::new();
+                let mut buf = TransmitBuf::new(
+                    &mut bytes,
+                    NonZeroUsize::MIN,
+                    if coalesced { 1200 } else { tail_capacity },
+                );
+                buf.start_new_datagram();
+                let mut prefix = Vec::new();
+                let mut pad = PadDatagram::No;
+                if coalesced {
+                    let pns = conn.spaces[SpaceId::Initial].for_path(PathId::ZERO);
+                    pns.pending_acks.insert_one(0, now);
+                    pns.pending_acks.set_immediate_ack_required();
+                    let mut ack = Vec::new();
+                    frame::Ack::encoder(0, pns.pending_acks.ranges(), Some(&pns.ecn_counters))
+                        .encode(&mut ack);
+                    let mut header = Vec::new();
+                    Header::Initial(InitialHeader {
+                        src_cid: conn.handshake_cid,
+                        dst_cid: cid,
+                        token: vec![0; 64].into(),
+                        number: PacketNumber::new(0, 0),
+                        version: conn.version,
+                    })
+                    .encode(&mut header);
+                    let token_len = 1200
+                        - tail_capacity
+                        - (header.len() - 64)
+                        - keys.packet.remote.tag_len()
+                        - ack.len();
+                    let ConnectionSide::Client { token, .. } = &mut conn.side else {
+                        unreachable!();
+                    };
+                    *token = vec![0; token_len].into();
+                    let status = conn.poll_transmit_path_space(
+                        now,
+                        &mut buf,
+                        PathId::ZERO,
+                        SpaceId::Initial,
+                        cid,
+                        &scheduling,
+                        false,
+                        pad,
+                    );
+                    let PollPathSpaceStatus::WrotePacket { pad_datagram, .. } = status else {
+                        panic!(
+                            "expected deferred Initial padding: coalesced={coalesced}, status={status:?}"
+                        );
+                    };
+                    pad = pad_datagram;
+                    assert!(matches!(pad, PadDatagram::ToMinMtu));
+                    assert_eq!(buf.datagram_remaining_mut(), tail_capacity);
+                    prefix = buf.as_mut_slice().to_vec();
+                }
+                let status = conn.poll_transmit_path_space(
+                    now,
+                    &mut buf,
+                    PathId::ZERO,
+                    SpaceId::Handshake,
+                    cid,
+                    &scheduling,
+                    false,
+                    pad,
+                );
+                let pns = conn.spaces[SpaceId::Handshake].for_path(PathId::ZERO);
+                assert!(pns.pending_acks.can_send());
+                assert_eq!(
+                    pns.pending_acks.ranges().iter().collect::<Vec<_>>(),
+                    history
+                );
+                assert_eq!(conn.stats().frame_tx.acks, u64::from(coalesced));
+                assert_eq!(
+                    conn.crypto_state.has_keys(EncryptionLevel::Initial),
+                    !coalesced
+                );
+                if coalesced {
+                    let PollPathSpaceStatus::Send { last_packet_number } = status else {
+                        panic!(
+                            "expected authenticated padding tail: coalesced={coalesced}, status={status:?}"
+                        );
+                    };
+                    let sent = conn.spaces[SpaceId::Handshake]
+                        .for_path(PathId::ZERO)
+                        .sent_packets
+                        .get(last_packet_number)
+                        .unwrap();
+                    assert_eq!(usize::from(sent.size), 1200 - prefix.len());
+                    assert!(!sent.ack_eliciting);
+                    assert!(sent.largest_acked.is_empty());
+                    assert_eq!(buf.len(), 1200);
+                    assert_eq!(&buf.as_mut_slice()[..prefix.len()], prefix);
+                    let (initial, rest) = PartialDecode::new(
+                        bytes::BytesMut::from(&buf.as_mut_slice()[..]),
+                        &FixedLengthConnectionIdParser::new(20),
+                        crate::DEFAULT_SUPPORTED_VERSIONS,
+                        false,
+                    )
+                    .unwrap();
+                    let mut initial = initial.finish(Some(&*keys.header.remote)).unwrap();
+                    let pn = initial.header.number().unwrap().expand(0);
+                    keys.packet
+                        .remote
+                        .decrypt(PathId::ZERO, pn, &initial.header_data, &mut initial.payload)
+                        .unwrap();
+                    assert!(
+                        frame::Iter::new(initial.payload.freeze())
+                            .unwrap()
+                            .map(Result::unwrap)
+                            .any(|frame| matches!(frame, Frame::Ack(_)))
+                    );
+                    let (tail, rest) = PartialDecode::new(
+                        rest.unwrap(),
+                        &FixedLengthConnectionIdParser::new(20),
+                        crate::DEFAULT_SUPPORTED_VERSIONS,
+                        false,
+                    )
+                    .unwrap();
+                    assert!(rest.is_none());
+                    let mut tail = tail.finish(Some(&*keys.header.remote)).unwrap();
+                    assert!(matches!(
+                        tail.header,
+                        Header::Long {
+                            ty: crate::packet::LongType::Handshake,
+                            ..
+                        }
+                    ));
+                    let pn = tail.header.number().unwrap().expand(0);
+                    keys.packet
+                        .remote
+                        .decrypt(PathId::ZERO, pn, &tail.header_data, &mut tail.payload)
+                        .unwrap();
+                    let frames: Vec<_> = frame::Iter::new(tail.payload.freeze())
+                        .unwrap()
+                        .map(Result::unwrap)
+                        .collect();
+                    assert!(!frames.is_empty());
+                    assert!(frames.iter().all(|frame| matches!(frame, Frame::Padding)));
+                } else {
+                    assert!(
+                        matches!(status, PollPathSpaceStatus::NothingToSend { .. }),
+                        "coalesced={coalesced}, status={status:?}"
+                    );
+                    assert!(buf.is_empty());
+                    assert!(
+                        conn.spaces[SpaceId::Handshake]
+                            .for_path(PathId::ZERO)
+                            .sent_packets
+                            .is_empty()
+                    );
+                }
+                // A fresh datagram fits the retained ACK. Once it is sent, two further
+                // polls must not emit standalone padding-only packets.
+                let mut later = Vec::new();
+                let mut buf = TransmitBuf::new(&mut later, NonZeroUsize::MIN, 1200);
+                buf.start_new_datagram();
+                let status = conn.poll_transmit_path_space(
+                    now,
+                    &mut buf,
+                    PathId::ZERO,
+                    SpaceId::Handshake,
+                    cid,
+                    &scheduling,
+                    false,
+                    PadDatagram::No,
+                );
+                assert!(
+                    matches!(status, PollPathSpaceStatus::WrotePacket { .. }),
+                    "coalesced={coalesced}, status={status:?}"
+                );
+                assert!(!conn.crypto_state.has_keys(EncryptionLevel::Initial));
+                assert!(
+                    !conn.spaces[SpaceId::Handshake]
+                        .for_path(PathId::ZERO)
+                        .pending_acks
+                        .can_send()
+                );
+                let (packet, rest) = PartialDecode::new(
+                    bytes::BytesMut::from(&buf.as_mut_slice()[..]),
+                    &FixedLengthConnectionIdParser::new(20),
+                    crate::DEFAULT_SUPPORTED_VERSIONS,
+                    false,
+                )
+                .unwrap();
+                assert!(rest.is_none());
+                let mut packet = packet.finish(Some(&*keys.header.remote)).unwrap();
+                let pn = packet.header.number().unwrap().expand(0);
+                keys.packet
+                    .remote
+                    .decrypt(PathId::ZERO, pn, &packet.header_data, &mut packet.payload)
+                    .unwrap();
+                assert!(
+                    frame::Iter::new(packet.payload.freeze())
+                        .unwrap()
+                        .map(Result::unwrap)
+                        .any(|frame| matches!(frame, Frame::Ack(_)))
+                );
+                for _ in 0..2 {
+                    let mut idle = Vec::new();
+                    let mut buf = TransmitBuf::new(&mut idle, NonZeroUsize::MIN, 1200);
+                    let status = conn.poll_transmit_path_space(
+                        now,
+                        &mut buf,
+                        PathId::ZERO,
+                        SpaceId::Handshake,
+                        cid,
+                        &scheduling,
+                        false,
+                        PadDatagram::No,
+                    );
+                    assert!(
+                        matches!(status, PollPathSpaceStatus::NothingToSend { .. }),
+                        "coalesced={coalesced}, status={status:?}"
+                    );
+                    assert!(buf.is_empty());
+                }
+            }
+        }
+
+        #[test]
+        fn multipath_acks_reserve_ack_frequency_and_defer_without_state_loss() {
+            for receiving_ecn in [false, true] {
+                let mut config = TransportConfig::default();
+                config.max_concurrent_multipath_paths(2);
+                config.ack_frequency_config(Some(crate::AckFrequencyConfig {
+                    ack_eliciting_threshold: VarInt::MAX,
+                    max_ack_delay: Some(Duration::from_millis(50)),
+                    reordering_threshold: VarInt::MAX,
+                }));
+                let mut conn = crate::tests::security_connection(config);
+                let now = Instant::now();
+                conn.receiving_ecn = receiving_ecn;
+                conn.ack_frequency = AckFrequencyState::new(Duration::from_millis(25));
+                conn.spaces[SpaceId::Data] = PacketSpace::new_deterministic(now, SpaceId::Data);
+                assert!(conn.is_multipath_negotiated());
+                conn.peer_params.min_ack_delay = Some(VarInt(50_000));
+                let paths = [PathId::ZERO, PathId(64)];
+                for path in paths {
+                    if path != PathId::ZERO {
+                        let mut other = PacketSpace::new_deterministic(now, SpaceId::Data);
+                        conn.spaces[SpaceId::Data]
+                            .number_spaces
+                            .insert(path, other.number_spaces.remove(&PathId::ZERO).unwrap());
+                    }
+                    let pns = conn.spaces[SpaceId::Data].for_path(path);
+                    for pn in 0..64 {
+                        pns.pending_acks.insert_one((1 << 30) + pn * 16386, now);
+                    }
+                    pns.pending_acks.set_immediate_ack_required();
+                    pns.ecn_counters = frame::EcnCounts {
+                        ect0: 1 << 30,
+                        ect1: 1 << 30,
+                        ce: 1 << 30,
+                    };
+                }
+                let histories: Vec<_> = paths
+                    .iter()
+                    .map(|&path| {
+                        conn.spaces[SpaceId::Data]
+                            .for_path(path)
+                            .pending_acks
+                            .ranges()
+                            .iter()
+                            .collect::<Vec<_>>()
+                    })
+                    .collect();
+                conn.spaces[SpaceId::Data].pending.ack_frequency = true;
+                let updates_before = conn.stats().frame_tx.ack_frequency;
+                let scheduling = PathSchedulingInfo {
+                    is_abandoned: false,
+                    may_send_data: true,
+                    may_send_close: false,
+                    may_self_abandon: false,
+                };
+                // The first packet cannot fit the conservative update bound, but can
+                // still acknowledge a useful subset. The next two exercise reservation
+                // under competing ACK pressure and then a new outgoing sequence number.
+                for (poll, budget) in [frame::AckFrequency::SIZE_BOUND - 1, 256, 256]
+                    .into_iter()
+                    .enumerate()
+                {
+                    if poll == 2 {
+                        conn.spaces[SpaceId::Data].pending.ack_frequency = true;
+                    }
+                    let mut bytes = Vec::new();
+                    let mut buf = TransmitBuf::new(&mut bytes, NonZeroUsize::MIN, budget);
+                    buf.start_new_datagram();
+                    let mut builder = PacketBuilder::simple_data_buf(&mut buf);
+                    builder.packet_number = poll as u64;
+                    conn.populate_packet(
+                        now,
+                        SpaceId::Data,
+                        PathId::ZERO,
+                        &scheduling,
+                        &mut builder,
+                    );
+                    assert!(builder.buf.len() <= budget);
+                    let frames: Vec<_> = if poll == 0 && receiving_ecn {
+                        assert!(builder.buf.is_empty());
+                        Vec::new()
+                    } else {
+                        frame::Iter::new(Bytes::copy_from_slice(builder.buf.as_mut_slice()))
+                            .unwrap()
+                            .map(Result::unwrap)
+                            .collect()
+                    };
+                    if poll != 0 || !receiving_ecn {
+                        assert!(
+                            frames
+                                .iter()
+                                .any(|frame| matches!(frame, Frame::PathAck(_)))
+                        );
+                    } else {
+                        assert!(frames.is_empty());
+                        assert!(builder.sent_frames().largest_acked.is_empty());
+                    }
+                    let updates: Vec<_> = frames
+                        .iter()
+                        .filter_map(|frame| match frame {
+                            Frame::AckFrequency(update) => Some(update),
+                            _ => None,
+                        })
+                        .collect();
+                    assert_eq!(updates.len(), usize::from(poll != 0));
+                    assert_eq!(conn.spaces[SpaceId::Data].pending.ack_frequency, poll == 0);
+                    assert_eq!(
+                        builder
+                            .sent_frames()
+                            .retransmits
+                            .get()
+                            .is_some_and(|sent| sent.ack_frequency),
+                        poll != 0
+                    );
+                    for frame in &frames {
+                        if let Frame::PathAck(ack) = frame {
+                            let (ack, path) = ack.clone().into_ack();
+                            let index = paths.iter().position(|&id| id == path).unwrap();
+                            assert!(
+                                ack.ranges
+                                    .iter()
+                                    .all(|range| histories[index].contains(&range))
+                            );
+                            assert_eq!(
+                                builder.sent_frames().largest_acked.get(&path),
+                                Some(&ack.largest)
+                            );
+                        }
+                    }
+                    for (index, path) in paths.iter().copied().enumerate() {
+                        assert_eq!(
+                            conn.spaces[SpaceId::Data]
+                                .for_path(path)
+                                .pending_acks
+                                .ranges()
+                                .iter()
+                                .collect::<Vec<_>>(),
+                            histories[index]
+                        );
+                    }
+                    if poll == 0 {
+                        assert_eq!(
+                            conn.ack_frequency.max_ack_delay_for_pto(),
+                            Duration::from_millis(25)
+                        );
+                        conn.ack_frequency.on_acked(PathId::ZERO, 0);
+                        assert_eq!(
+                            conn.ack_frequency.peer_max_ack_delay,
+                            Duration::from_millis(25)
+                        );
+                    } else {
+                        assert_eq!(updates[0].sequence, VarInt((poll - 1) as u64));
+                        assert_eq!(updates[0].ack_eliciting_threshold, VarInt::MAX);
+                        assert_eq!(updates[0].reordering_threshold, VarInt::MAX);
+                        assert_eq!(updates[0].request_max_ack_delay, VarInt(50_000));
+                        conn.ack_frequency.on_acked(PathId::ZERO, poll as u64);
+                        assert_eq!(
+                            conn.ack_frequency.peer_max_ack_delay,
+                            Duration::from_millis(50)
+                        );
+                    }
+                }
+                assert_eq!(conn.stats().frame_tx.ack_frequency, updates_before + 2);
+            }
+        }
+
+        #[test]
+        fn large_initial_token_leaves_room_for_close() {
+            let now = Instant::now();
+            for mtu in [1200, 1500] {
+                for case in 0..4 {
+                    let mut conn = initial_connection(now, mtu as u16);
+                    let keys = conn
+                        .crypto_state
+                        .session
+                        .initial_keys(conn.initial_dst_cid, Side::Server);
+                    conn.receiving_ecn = false;
+                    // Measure this fork's ACK encoding, rather than assuming an upstream size.
+                    let pns = conn.spaces[SpaceId::Initial].for_path(PathId::ZERO);
+                    for pn in (0..32).step_by(2) {
+                        pns.pending_acks.insert_one(pn, now);
+                    }
+                    let mut ack = Vec::new();
+                    frame::Ack::encoder(0, pns.pending_acks.ranges(), None).encode(&mut ack);
+                    let frame_space = frame::ConnectionClose::SIZE_BOUND
+                        + match case {
+                            0 => 0,
+                            1 => ack.len() - 1,
+                            2 => ack.len(),
+                            _ => ack.len() + 1,
+                        };
+                    let mut header = Vec::new();
+                    Header::Initial(InitialHeader {
+                        src_cid: conn.handshake_cid,
+                        dst_cid: conn.initial_dst_cid,
+                        token: vec![0; 64].into(),
+                        number: PacketNumber::new(0, 0),
+                        version: conn.version,
+                    })
+                    .encode(&mut header);
+                    let token_len =
+                        mtu - (header.len() - 64) - keys.packet.remote.tag_len() - frame_space;
+                    assert!((64..16384).contains(&token_len));
+                    let ConnectionSide::Client { token, .. } = &mut conn.side else {
+                        unreachable!();
+                    };
+                    *token = vec![0; token_len].into();
+                    conn.close(now, 0u32.into(), Bytes::new());
+                    let mut bytes = Vec::new();
+                    assert!(
+                        conn.poll_transmit(now, NonZeroUsize::MIN, &mut bytes)
+                            .is_some()
+                    );
+                    assert!(bytes.len() <= mtu);
+                    assert!(!conn.connection_close_pending);
+                    let (packet, rest) = PartialDecode::new(
+                        bytes.as_slice().into(),
+                        &FixedLengthConnectionIdParser::new(0),
+                        crate::DEFAULT_SUPPORTED_VERSIONS,
+                        false,
+                    )
+                    .unwrap();
+                    assert!(rest.is_none());
+                    let mut packet = packet.finish(Some(&*keys.header.remote)).unwrap();
+                    let pn = packet.header.number().unwrap().expand(0);
+                    keys.packet
+                        .remote
+                        .decrypt(PathId::ZERO, pn, &packet.header_data, &mut packet.payload)
+                        .unwrap();
+                    let mut frames = frame::Iter::new(packet.payload.freeze())
+                        .unwrap()
+                        .map(Result::unwrap)
+                        .filter(|frame| !matches!(frame, Frame::Padding));
+                    if case >= 1 {
+                        assert!(matches!(frames.next(), Some(Frame::Ack(_))));
+                    }
+                    assert!(matches!(
+                        frames.next(),
+                        Some(Frame::Close(Close::Connection(frame::ConnectionClose {
+                            error_code: TransportErrorCode::APPLICATION_ERROR,
+                            ..
+                        })))
+                    ));
+                    assert!(frames.next().is_none());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_ack_budget_preserves_ranges_and_sent_metadata() {
+        use std::num::NonZeroUsize;
+
+        for multipath in [false, true] {
+            for receiving_ecn in [false, true] {
+                for path in [
+                    PathId::ZERO,
+                    PathId(63),
+                    PathId(64),
+                    PathId(16383),
+                    PathId(16384),
+                    PathId(1 << 30),
+                ] {
+                    if !multipath && path != PathId::ZERO {
+                        continue;
+                    }
+                    let now = Instant::now();
+                    let mut space = PacketSpace::new_deterministic(now, SpaceId::Data);
+                    if path != PathId::ZERO {
+                        let pns = space.number_spaces.remove(&PathId::ZERO).unwrap();
+                        space.number_spaces.insert(path, pns);
+                    }
+                    let pns = space.for_path(path);
+                    for pn in (0..128).step_by(2) {
+                        pns.pending_acks.insert_one((1 << 30) + pn, now);
+                    }
+                    pns.pending_acks.set_immediate_ack_required();
+                    pns.ecn_counters = frame::EcnCounts {
+                        ect0: 64,
+                        ect1: 16384,
+                        ce: 1 << 30,
+                    };
+                    let history: Vec<_> = pns.pending_acks.ranges().iter().collect();
+                    let ecn = receiving_ecn.then_some(&pns.ecn_counters);
+                    let encoder: frame::EncodableFrame<'_> = if multipath {
+                        frame::PathAck::encoder(path, 0, pns.pending_acks.ranges(), ecn).into()
+                    } else {
+                        frame::Ack::encoder(0, pns.pending_acks.ranges(), ecn).into()
+                    };
+                    let mut full = Vec::new();
+                    encoder.encode(&mut full);
+                    let mut minimum = crate::range_set::ArrayRangeSet::default();
+                    minimum.insert(history.last().unwrap().clone());
+                    let encoder: frame::EncodableFrame<'_> = if multipath {
+                        frame::PathAck::encoder(path, 0, &minimum, ecn).into()
+                    } else {
+                        frame::Ack::encoder(0, &minimum, ecn).into()
+                    };
+                    let mut smallest = Vec::new();
+                    encoder.encode(&mut smallest);
+                    for budget in 0..=full.len() + 1 {
+                        let mut bytes = Vec::new();
+                        let mut buf =
+                            TransmitBuf::new(&mut bytes, NonZeroUsize::MIN, budget.max(1));
+                        buf.start_new_datagram_with_size(budget);
+                        let mut builder = PacketBuilder::simple_data_buf(&mut buf);
+                        let mut stats = FrameStats::default();
+                        Connection::populate_acks(
+                            now,
+                            receiving_ecn,
+                            path,
+                            SpaceId::Data,
+                            &mut space,
+                            multipath,
+                            &mut builder,
+                            &mut stats,
+                            true,
+                            0,
+                        );
+                        assert!(builder.buf.len() <= budget);
+                        let pns = space.for_path(path);
+                        assert_eq!(
+                            pns.pending_acks.ranges().iter().collect::<Vec<_>>(),
+                            history
+                        );
+                        assert!(pns.pending_acks.can_send());
+                        if budget < smallest.len() {
+                            assert!(builder.buf.is_empty());
+                            assert!(builder.sent_frames().largest_acked.is_empty());
+                            assert_eq!(stats.acks + stats.path_acks, 0);
+                            continue;
+                        }
+                        assert_eq!(stats.acks, u64::from(!multipath));
+                        assert_eq!(stats.path_acks, u64::from(multipath));
+                        let largest = history.last().unwrap().end - 1;
+                        assert_eq!(
+                            builder.sent_frames().largest_acked.get(&path),
+                            Some(&largest)
+                        );
+                        let mut frames =
+                            frame::Iter::new(Bytes::copy_from_slice(builder.buf.as_mut_slice()))
+                                .unwrap()
+                                .map(Result::unwrap);
+                        let ack = match frames.next().unwrap() {
+                            Frame::Ack(ack) => {
+                                assert!(!multipath);
+                                ack
+                            }
+                            Frame::PathAck(ack) => {
+                                assert!(multipath);
+                                let (ack, decoded_path) = ack.into_ack();
+                                assert_eq!(decoded_path, path);
+                                ack
+                            }
+                            _ => panic!("expected ACK or PathACK"),
+                        };
+                        assert!(frames.next().is_none());
+                        assert_eq!(ack.largest, largest);
+                        assert_eq!(ack.ecn, receiving_ecn.then_some(pns.ecn_counters));
+                        assert!(ack.ranges.iter().all(|range| history.contains(&range)));
+                        if budget >= full.len() {
+                            assert_eq!(builder.buf.as_mut_slice(), full);
+                        } else {
+                            assert!(ack.ranges.range_count() < history.len());
+                        }
+                        if budget == smallest.len() || budget == full.len() {
+                            assert_eq!(builder.frame_space_remaining(), 0);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bounded_ack_ranges_account_for_varint_boundaries() {
+        let mut ranges = crate::range_set::ArrayRangeSet::default();
+        // A 65th range widens the encoded count. Pending receive history currently
+        // caps at 64, but the encoding helper must not depend on that policy.
+        for pn in 0..65 {
+            ranges.insert((1 << 30) + pn * 16386..(1 << 30) + pn * 16386 + 65);
+        }
+        for delay in [63, 64, 16383, 16384, 1 << 30] {
+            let mut full = Vec::new();
+            frame::Ack::encoder(delay, &ranges, None).encode(&mut full);
+            for budget in 0..=full.len() {
+                let Some(selected) = frame::Ack::bounded_ranges(None, delay, &ranges, None, budget)
+                else {
+                    continue;
+                };
+                let mut encoded = Vec::new();
+                frame::Ack::encoder(delay, &selected, None).encode(&mut encoded);
+                assert!(encoded.len() <= budget);
+                assert_eq!(selected.max(), ranges.max());
+                if budget == full.len() {
+                    assert_eq!(encoded, full);
+                } else {
+                    assert!(selected.range_count() < 65);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn close_ack_budget_preserves_exact_fit_across_paths() {
+        use std::num::NonZeroUsize;
+
+        for multipath in [false, true] {
+            for receiving_ecn in [false, true] {
+                let now = Instant::now();
+                let paths = if multipath {
+                    vec![PathId::ZERO, PathId(64), PathId(65536)]
+                } else {
+                    vec![PathId::ZERO]
+                };
+                let mut space = PacketSpace::new_deterministic(now, SpaceId::Data);
+                for &path in &paths {
+                    if path != PathId::ZERO {
+                        let mut other = PacketSpace::new_deterministic(now, SpaceId::Data);
+                        space
+                            .number_spaces
+                            .insert(path, other.number_spaces.remove(&PathId::ZERO).unwrap());
+                    }
+                    let pns = space.for_path(path);
+                    for pn in (0..128).step_by(2) {
+                        pns.pending_acks.insert_one(pn, now);
+                    }
+                    pns.ecn_counters = frame::EcnCounts {
+                        ect0: 64,
+                        ect1: 16384,
+                        ce: 1 << 30,
+                    };
+                }
+                let sizes: Vec<_> = paths
+                    .iter()
+                    .map(|&path| {
+                        let pns = space.for_path(path);
+                        let ecn = receiving_ecn.then_some(&pns.ecn_counters);
+                        let ack: frame::EncodableFrame<'_> = if multipath {
+                            frame::PathAck::encoder(path, 0, pns.pending_acks.ranges(), ecn).into()
+                        } else {
+                            frame::Ack::encoder(0, pns.pending_acks.ranges(), ecn).into()
+                        };
+                        let mut encoded = Vec::new();
+                        ack.encode(&mut encoded);
+                        encoded.len()
+                    })
+                    .collect();
+                for accepted in 0..=paths.len() {
+                    for shortfall in [0, 1] {
+                        if accepted == 0 && shortfall != 0 {
+                            continue;
+                        }
+                        let budget = frame::ConnectionClose::SIZE_BOUND
+                            + sizes[..accepted].iter().sum::<usize>()
+                            - shortfall;
+                        let mut bytes = Vec::new();
+                        let mut buf = TransmitBuf::new(&mut bytes, NonZeroUsize::MIN, budget);
+                        buf.start_new_datagram();
+                        let mut builder = PacketBuilder::simple_data_buf(&mut buf);
+                        let mut stats = FrameStats::default();
+                        for &path in &paths {
+                            Connection::populate_acks(
+                                now,
+                                receiving_ecn,
+                                path,
+                                SpaceId::Data,
+                                &mut space,
+                                multipath,
+                                &mut builder,
+                                &mut stats,
+                                true,
+                                frame::ConnectionClose::SIZE_BOUND,
+                            );
+                            assert!(
+                                builder.frame_space_remaining()
+                                    >= frame::ConnectionClose::SIZE_BOUND
+                            );
+                        }
+                        if shortfall == 0 {
+                            assert_eq!(
+                                builder.frame_space_remaining(),
+                                frame::ConnectionClose::SIZE_BOUND
+                            );
+                        }
+                        let close: Close = TransportError::NO_ERROR("").into();
+                        let remaining = builder.frame_space_remaining();
+                        builder.write_frame(close.encoder(remaining), &mut stats);
+                        let payload = Bytes::copy_from_slice(builder.buf.as_mut_slice());
+                        let frames: Vec<_> = frame::Iter::new(payload)
+                            .unwrap()
+                            .map(Result::unwrap)
+                            .collect();
+                        assert_eq!(frames.len(), accepted + 1);
+                        assert!(matches!(frames.last(), Some(Frame::Close(_))));
+                        assert!(frames[..frames.len() - 1].iter().all(|frame| {
+                            matches!(frame, Frame::PathAck(_)) == multipath
+                                && matches!(frame, Frame::Ack(_) | Frame::PathAck(_))
+                        }));
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn negotiate_max_idle_timeout_commutative() {
